@@ -89,26 +89,11 @@ contract MockTEERegistry is ITEEServiceRegistry {
 
 /**
  * The real HTTP precompile returns raw bytes. Keeping this as fallback(bytes) avoids
- * the extra ABI layer a named Solidity function would add. The mock also decodes and
- * records the requested URL so tests can prove retry rotation reached the precompile.
+ * the extra ABI layer a named Solidity function would add. Production encodes the 13
+ * request fields directly, so the mock decodes that same flat wire layout rather than
+ * pretending the payload is a single struct tuple.
  */
 contract MockHTTPPrecompile {
-    struct HTTPRequest {
-        address executor;
-        bytes[] encryptedSecrets;
-        uint256 ttl;
-        bytes[] secretSignatures;
-        bytes userPublicKey;
-        string url;
-        uint8 method;
-        string[] headerKeys;
-        string[] headerValues;
-        bytes body;
-        uint256 dkmsKeyIndex;
-        uint8 dkmsKeyFormat;
-        bool piiEnabled;
-    }
-
     uint16 public status;
     bytes public body;
     string public errorMessage;
@@ -130,8 +115,38 @@ contract MockHTTPPrecompile {
     fallback(bytes calldata input) external returns (bytes memory) {
         if (forceRevert) revert("mock HTTP failure");
 
-        HTTPRequest memory request = abi.decode(input, (HTTPRequest));
-        lastUrl = request.url;
+        (
+            ,
+            ,
+            ,
+            ,
+            ,
+            string memory requestedUrl,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+        ) = abi.decode(
+            input,
+            (
+                address,
+                bytes[],
+                uint256,
+                bytes[],
+                bytes,
+                string,
+                uint8,
+                string[],
+                string[],
+                bytes,
+                uint256,
+                uint8,
+                bool
+            )
+        );
+        lastUrl = requestedUrl;
 
         string[] memory keys = new string[](0);
         string[] memory values = new string[](0);
