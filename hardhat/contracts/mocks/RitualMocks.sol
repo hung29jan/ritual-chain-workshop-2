@@ -155,7 +155,9 @@ contract MockJQPrecompile {
         returnEmpty = returnEmpty_;
     }
 
-    fallback(bytes calldata) external view returns (bytes memory) {
+    // Solidity fallback functions cannot be declared view. The production contract
+    // reaches this with STATICCALL, so this function deliberately performs no writes.
+    fallback(bytes calldata) external returns (bytes memory) {
         if (returnEmpty) return bytes("");
         return abi.encode(parsedValue);
     }
