@@ -3,14 +3,7 @@ pragma solidity ^0.8.28;
 
 import {IScheduler, IRitualWallet, ITEEServiceRegistry} from "../ritual/RitualChain.sol";
 
-/**
- * Test-only stand-ins for Ritual's canonical contracts/precompiles.
- *
- * The tests deploy these normally, copy their runtime code with vm.etch, and place it
- * at the exact Ritual addresses. Storage starts empty at the etched addresses and is
- * configured through the setters below.
- */
-
+/** Test-only stand-ins placed at Ritual's canonical addresses with vm.etch. */
 contract MockScheduler is IScheduler {
     uint256 public nextCallId;
     mapping(uint256 => uint8) public callState;
@@ -41,7 +34,6 @@ contract MockScheduler is IScheduler {
 
     function approveScheduler(address) external {}
 
-    /// Mimics Scheduler executionIndex injection at the semantic level for tests.
     function fire(address target, uint256 executionIndex, uint256 marketId) external {
         (bool ok, bytes memory reason) = target.call(
             abi.encodeWithSignature(
@@ -96,16 +88,32 @@ contract MockTEERegistry is ITEEServiceRegistry {
 }
 
 /**
- * HTTP is a short-running async precompile. Its settled response is raw bytes, not an
- * ABI-encoded Solidity `bytes` return value. A fallback(bytes) return is intentional:
- * using a normal named Solidity function here adds an extra ABI layer and makes the
- * production decoder fail for the wrong reason.
+ * The real HTTP precompile returns raw bytes. Keeping this as fallback(bytes) avoids
+ * the extra ABI layer a named Solidity function would add. The mock also decodes and
+ * records the requested URL so tests can prove retry rotation reached the precompile.
  */
 contract MockHTTPPrecompile {
+    struct HTTPRequest {
+        address executor;
+        bytes[] encryptedSecrets;
+        uint256 ttl;
+        bytes[] secretSignatures;
+        bytes userPublicKey;
+        string url;
+        uint8 method;
+        string[] headerKeys;
+        string[] headerValues;
+        bytes body;
+        uint256 dkmsKeyIndex;
+        uint8 dkmsKeyFormat;
+        bool piiEnabled;
+    }
+
     uint16 public status;
     bytes public body;
     string public errorMessage;
     bool public forceRevert;
+    string public lastUrl;
 
     function configure(
         uint16 status_,
@@ -121,6 +129,10 @@ contract MockHTTPPrecompile {
 
     fallback(bytes calldata input) external returns (bytes memory) {
         if (forceRevert) revert("mock HTTP failure");
+
+        HTTPRequest memory request = abi.decode(input, (HTTPRequest));
+        lastUrl = request.url;
+
         string[] memory keys = new string[](0);
         string[] memory values = new string[](0);
         bytes memory actualOutput = abi.encode(
