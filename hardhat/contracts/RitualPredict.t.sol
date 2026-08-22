@@ -30,7 +30,6 @@ contract RitualPredictTest is Test {
         MockHTTPPrecompile(HTTP).configure(200, bytes('{"price":4000}'), "", false);
         MockJQPrecompile(JQ).configure(4000, false);
 
-        // 1000 ms makes the seconds-to-blocks conversion easy to reason about locally.
         predict = new RitualPredict(1000);
         vm.deal(alice, 10 ether);
         vm.deal(bob, 10 ether);
@@ -66,6 +65,12 @@ contract RitualPredictTest is Test {
         marketId = predict.createMarket(_params());
     }
 
+    function _createWithFallbacks(
+        string[] memory fallbacks
+    ) internal returns (uint256 marketId) {
+        marketId = predict.createMarketWithFallbacks(_params(), fallbacks);
+    }
+
     function _rollToResolve(uint256 marketId) internal {
         RitualPredict.Market memory market = predict.getMarket(marketId);
         vm.roll(market.resolveBlock);
@@ -97,6 +102,20 @@ contract RitualPredictTest is Test {
         p.bettingSeconds = 29;
         vm.expectRevert(RitualPredict.BadDuration.selector);
         predict.createMarket(p);
+    }
+
+    function testRejectsDuplicateAndExcessFallbacks() public {
+        string[] memory duplicate = new string[](1);
+        duplicate[0] = "https://oracle.example/eth";
+        vm.expectRevert(RitualPredict.DuplicateOracle.selector);
+        predict.createMarketWithFallbacks(_params(), duplicate);
+
+        string[] memory tooMany = new string[](3);
+        tooMany[0] = "https://fallback-a.example/eth";
+        tooMany[1] = "https://fallback-b.example/eth";
+        tooMany[2] = "https://fallback-c.example/eth";
+        vm.expectRevert(RitualPredict.TooManyFallbackOracles.selector);
+        predict.createMarketWithFallbacks(_params(), tooMany);
     }
 
     function testBettingClosesByBlockNumber() public {
@@ -169,6 +188,63 @@ contract RitualPredictTest is Test {
         vm.prank(alice);
         predict.claimRefund(marketId);
         assertEq(alice.balance - before, 2 ether);
+    }
+
+    function testFallbackOracleRotationReachesHTTPPrecompile() public {
+        string[] memory fallbacks = new string[](2);
+        fallbacks[0] = "https://fallback-a.example/eth";
+        fallbacks[1] = "https://fallback-b.example/eth";
+        uint256 marketId = _createWithFallbacks(fallbacks);
+
+        vm.prank(alice);
+        predict.bet{value: 1 ether}(marketId, true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(marketId, false);
+
+        string[] memory urls = predict.getOracleUrls(marketId);
+        assertEq(urls.length, 3);
+        assertEq(urls[0], "https://oracle.example/eth");
+        assertEq(urls[1], fallbacks[0]);
+        assertEq(urls[2], fallbacks[1]);
+
+        // Keep each attempt alive long enough to inspect which URL actually entered
+        // the HTTP precompile. A 500 is an oracle failure, not a NO outcome.
+        MockHTTPPrecompile(HTTP).configure(500, bytes("down"), "", false);
+        _rollToResolve(marketId);
+
+        _fire(marketId, 0);
+        assertEq(MockHTTPPrecompile(HTTP).lastUrl(), "https://oracle.example/eth");
+
+        _fire(marketId, 1);
+        assertEq(MockHTTPPrecompile(HTTP).lastUrl(), fallbacks[0]);
+
+        _fire(marketId, 2);
+        assertEq(MockHTTPPrecompile(HTTP).lastUrl(), fallbacks[1]);
+
+        RitualPredict.Market memory market = predict.getMarket(marketId);
+        assertEq(uint256(market.state), uint256(RitualPredict.MarketState.Invalid));
+        assertEq(market.attempts, 3);
+    }
+
+    function testSingleFallbackCyclesBackToPrimary() public {
+        string[] memory fallbacks = new string[](1);
+        fallbacks[0] = "https://fallback-only.example/eth";
+        uint256 marketId = _createWithFallbacks(fallbacks);
+
+        vm.prank(alice);
+        predict.bet{value: 1 ether}(marketId, true);
+        vm.prank(bob);
+        predict.bet{value: 1 ether}(marketId, false);
+
+        MockHTTPPrecompile(HTTP).configure(500, bytes("down"), "", false);
+        _rollToResolve(marketId);
+
+        _fire(marketId, 0);
+        assertEq(MockHTTPPrecompile(HTTP).lastUrl(), "https://oracle.example/eth");
+        _fire(marketId, 1);
+        assertEq(MockHTTPPrecompile(HTTP).lastUrl(), fallbacks[0]);
+        _fire(marketId, 2);
+        assertEq(MockHTTPPrecompile(HTTP).lastUrl(), "https://oracle.example/eth");
     }
 
     function testEmptyWinningSideInvalidatesInsteadOfDividingByZero() public {
