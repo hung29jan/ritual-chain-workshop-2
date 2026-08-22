@@ -1,5 +1,12 @@
 import hardhatToolboxViemPlugin from "@nomicfoundation/hardhat-toolbox-viem";
-import { configVariable, defineConfig } from "hardhat/config";
+import { defineConfig } from "hardhat/config";
+
+// Node 20+ can load .env without adding dotenv. Missing .env is expected in CI/local tests.
+try {
+  process.loadEnvFile();
+} catch {
+  // no local .env file
+}
 
 export default defineConfig({
   plugins: [hardhatToolboxViemPlugin],
@@ -30,14 +37,12 @@ export default defineConfig({
       type: "edr-simulated",
       chainType: "l1",
     },
-    // Ritual Chain testnet. Requires EIP-1559 (type-2) transactions; viem sends
-    // those by default.
     ritual: {
       type: "http",
       chainType: "l1",
       chainId: 1979,
-      url: "https://rpc.ritualfoundation.org",
-      accounts: [configVariable("DEPLOYER_PRIVATE_KEY")],
+      url: process.env.RITUAL_RPC_URL ?? "https://rpc.ritualfoundation.org",
+      accounts: process.env.RITUAL_PRIVATE_KEY ? [process.env.RITUAL_PRIVATE_KEY] : [],
     },
   },
 });
