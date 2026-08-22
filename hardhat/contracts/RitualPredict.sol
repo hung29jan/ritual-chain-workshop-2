@@ -6,22 +6,12 @@ import {RitualChain, IScheduler, IRitualWallet, ITEEServiceRegistry} from "./rit
 /**
  * RitualPredict — a self-resolving binary prediction market.
  *
- * Users stake native RITUAL on YES or NO. When the betting window closes, nobody
- * clicks "resolve" and no backend cron runs: the Ritual Scheduler wakes the contract
- * at a block chosen at market-creation time. The contract then calls the HTTP
- * precompile (0x0801) to read the configured oracle URL, extracts one number with the
- * jq precompile (0x0803), compares it to the target, and settles the market.
- *
- * Payouts are pari-mutuel and pull-based: each winner claims
- * `stake * totalPool / winningPool`. Nothing loops over participants.
- *
- * Every deadline is a BLOCK NUMBER, so "betting is closed" and "the Scheduler woke us"
- * can never disagree. Human durations are converted at `blockTimeMs`, measured from the
- * live chain at deploy time (`scripts/block-time.ts`).
+ * Users stake native RITUAL on YES or NO. At resolution the Ritual Scheduler wakes
+ * the contract and each retry can use a different immutable oracle endpoint. A TEE
+ * executor performs the HTTP request; the synchronous jq precompile extracts the
+ * configured uint256 value; the contract compares it with the target and settles.
  */
 contract RitualPredict {
-    // ─────────────────────────────── Types ───────────────────────────────
-
     enum MarketState {
         Open,
         Closed,
@@ -73,8 +63,6 @@ contract RitualPredict {
         uint256 resolveDelaySeconds;
     }
 
-    // ────────────────────────────── Constants ────────────────────────────
-
     uint32 public constant MAX_ATTEMPTS = 3;
     uint32 public constant RETRY_INTERVAL_BLOCKS = 200;
     uint32 public constant RESOLVE_GAS_LIMIT = 2_000_000;
@@ -87,18 +75,15 @@ contract RitualPredict {
     uint256 public constant MIN_RESOLVE_DELAY_SECONDS = 15;
     uint256 public constant MAX_MARKET_SECONDS = 1 days;
 
-    // ────────────────────────────── Storage ──────────────────────────────
-
     uint256 public immutable blockTimeMs;
 
     uint256 public marketCount;
     mapping(uint256 => Market) private _markets;
+    mapping(uint256 => string[]) private _fallbackOracleUrls;
 
     mapping(uint256 => mapping(address => uint256)) public yesStake;
     mapping(uint256 => mapping(address => uint256)) public noStake;
     mapping(uint256 => mapping(address => bool)) public settled;
-
-    // ────────────────────────────── Events ───────────────────────────────
 
     event MarketCreated(
         uint256 indexed marketId,
@@ -114,6 +99,16 @@ contract RitualPredict {
         string jsonPath,
         uint256 target,
         Comparator comparator
+    );
+    event FallbackOracleConfigured(
+        uint256 indexed marketId,
+        uint256 indexed fallbackIndex,
+        string oracleUrl
+    );
+    event OracleAttemptSelected(
+        uint256 indexed marketId,
+        uint8 indexed attempt,
+        string oracleUrl
     );
     event BetPlaced(
         uint256 indexed marketId,
@@ -148,8 +143,6 @@ contract RitualPredict {
         uint256 amount
     );
 
-    // ────────────────────────────── Errors ───────────────────────────────
-
     error UnknownMarket();
     error OnlyScheduler();
     error BettingClosed();
@@ -161,13 +154,12 @@ contract RitualPredict {
     error BadDuration();
     error EmptyString();
     error TransferFailed();
+    error TooManyFallbackOracles();
+    error DuplicateOracle();
 
     constructor(uint256 blockTimeMs_) {
         if (blockTimeMs_ == 0) revert BadDuration();
         blockTimeMs = blockTimeMs_;
-
-        // Scheduler callbacks and their execution fees are authorised once for the
-        // lifetime of this contract. The payer used below is always address(this).
         IScheduler(RitualChain.SCHEDULER).approveScheduler(
             RitualChain.SCHEDULER
         );
@@ -175,9 +167,32 @@ contract RitualPredict {
 
     // ───────────────────────── Market lifecycle ──────────────────────────
 
+    /// Backwards-compatible single-oracle market creation.
     function createMarket(
         NewMarket calldata p
     ) external returns (uint256 marketId) {
+        string[] memory noFallbacks = new string[](0);
+        return _createMarket(p, noFallbacks);
+    }
+
+    /**
+     * Creates a market with immutable fallback endpoints. With MAX_ATTEMPTS=3, at most
+     * two fallbacks are accepted. Attempt 1 uses the primary URL, attempt 2 fallback 1,
+     * and attempt 3 fallback 2. If only one fallback is supplied, attempt 3 rotates
+     * back to the primary URL.
+     */
+    function createMarketWithFallbacks(
+        NewMarket calldata p,
+        string[] calldata fallbackOracleUrls
+    ) external returns (uint256 marketId) {
+        string[] memory copied = fallbackOracleUrls;
+        return _createMarket(p, copied);
+    }
+
+    function _createMarket(
+        NewMarket calldata p,
+        string[] memory fallbackOracleUrls
+    ) private returns (uint256 marketId) {
         if (
             bytes(p.question).length == 0 ||
             bytes(p.oracleUrl).length == 0 ||
@@ -192,11 +207,24 @@ contract RitualPredict {
             p.bettingSeconds + p.resolveDelaySeconds > MAX_MARKET_SECONDS
         ) revert BadDuration();
 
+        if (fallbackOracleUrls.length > MAX_ATTEMPTS - 1)
+            revert TooManyFallbackOracles();
+
+        bytes32 primaryHash = keccak256(bytes(p.oracleUrl));
+        for (uint256 i = 0; i < fallbackOracleUrls.length; i++) {
+            if (bytes(fallbackOracleUrls[i]).length == 0) revert EmptyString();
+            bytes32 candidateHash = keccak256(bytes(fallbackOracleUrls[i]));
+            if (candidateHash == primaryHash) revert DuplicateOracle();
+            for (uint256 j = 0; j < i; j++) {
+                if (
+                    candidateHash ==
+                    keccak256(bytes(fallbackOracleUrls[j]))
+                ) revert DuplicateOracle();
+            }
+        }
+
         uint256 close = block.number + _secondsToBlocks(p.bettingSeconds);
         uint256 resolve = close + _secondsToBlocks(p.resolveDelaySeconds);
-
-        // Scheduler.startBlock is uint32. Reject instead of silently truncating a
-        // future block number if the chain ever approaches the boundary.
         if (resolve > type(uint32).max) revert BadDuration();
 
         marketId = marketCount + 1;
@@ -215,9 +243,15 @@ contract RitualPredict {
         m.state = MarketState.Open;
         m.outcome = Outcome.Unresolved;
 
-        // Scheduling is part of market creation. If it fails, the whole transaction
-        // reverts, so an apparently autonomous market can never be created without a
-        // corresponding Scheduler call.
+        for (uint256 i = 0; i < fallbackOracleUrls.length; i++) {
+            _fallbackOracleUrls[marketId].push(fallbackOracleUrls[i]);
+            emit FallbackOracleConfigured(
+                marketId,
+                i,
+                fallbackOracleUrls[i]
+            );
+        }
+
         m.scheduleId = _scheduleResolution(marketId, m.resolveBlock);
 
         emit MarketCreated(
@@ -254,14 +288,6 @@ contract RitualPredict {
         emit BetPlaced(marketId, msg.sender, isYes, msg.value);
     }
 
-    /**
-     * Scheduler callback. `executionIndex` is written into calldata bytes 4-35 by the
-     * Scheduler, so it must be the first parameter.
-     *
-     * Deliberately revert-free for anything that is not an authorisation failure: a
-     * reverted execution would roll back the attempt counter, and the market could then
-     * never reach `Invalid`.
-     */
     function onScheduledResolve(
         uint256 executionIndex,
         uint256 marketId
@@ -278,6 +304,13 @@ contract RitualPredict {
         m.attempts = attempt;
         m.state = MarketState.Resolving;
 
+        string memory selectedOracle = _oracleUrlForAttempt(
+            marketId,
+            m.oracleUrl,
+            attempt
+        );
+        emit OracleAttemptSelected(marketId, attempt, selectedOracle);
+
         address executor = _pickExecutor(marketId, executionIndex);
         emit ResolutionAttempted(marketId, attempt, executor);
 
@@ -288,7 +321,8 @@ contract RitualPredict {
 
         (bool ok, uint256 observed, string memory reason) = _readOracle(
             m,
-            executor
+            executor,
+            selectedOracle
         );
         if (!ok) {
             _fail(m, marketId, attempt, reason);
@@ -308,9 +342,7 @@ contract RitualPredict {
         m.state = MarketState.Resolved;
         emit MarketResolved(marketId, m.outcome, observed);
 
-        // A successful first/second attempt makes the remaining scheduled retries
-        // unnecessary. Cancellation is best-effort so a Scheduler-side cancellation
-        // problem cannot roll back an already valid oracle result.
+        // Best-effort cancellation preserves a valid result if Scheduler.cancel fails.
         RitualChain.SCHEDULER.call(
             abi.encodeCall(IScheduler.cancel, (m.scheduleId))
         );
@@ -346,7 +378,6 @@ contract RitualPredict {
         uint256 payout = _payout(m, marketId, msg.sender);
         if (payout == 0) revert NothingToClaim();
 
-        // Effect before interaction protects the pull-payment path from re-entrancy.
         settled[marketId][msg.sender] = true;
         emit WinningsClaimed(marketId, msg.sender, payout);
         _pay(msg.sender, payout);
@@ -397,6 +428,19 @@ contract RitualPredict {
         }
     }
 
+    /// Returns primary first, then immutable fallbacks in retry order.
+    function getOracleUrls(
+        uint256 marketId
+    ) external view returns (string[] memory urls) {
+        Market storage m = _market(marketId);
+        uint256 fallbackCount = _fallbackOracleUrls[marketId].length;
+        urls = new string[](fallbackCount + 1);
+        urls[0] = m.oracleUrl;
+        for (uint256 i = 0; i < fallbackCount; i++) {
+            urls[i + 1] = _fallbackOracleUrls[marketId][i];
+        }
+    }
+
     function stakesOf(
         uint256 marketId,
         address account
@@ -439,9 +483,22 @@ contract RitualPredict {
 
     // ───────────────────── Ritual: oracle read path ──────────────────────
 
+    function _oracleUrlForAttempt(
+        uint256 marketId,
+        string storage primaryOracle,
+        uint8 attempt
+    ) private view returns (string memory) {
+        uint256 fallbackCount = _fallbackOracleUrls[marketId].length;
+        uint256 oracleCount = fallbackCount + 1;
+        uint256 selected = (uint256(attempt) - 1) % oracleCount;
+        if (selected == 0) return primaryOracle;
+        return _fallbackOracleUrls[marketId][selected - 1];
+    }
+
     function _readOracle(
         Market storage m,
-        address executor
+        address executor,
+        string memory oracleUrl
     ) private returns (bool ok, uint256 value, string memory reason) {
         bytes[] memory emptyBytes = new bytes[](0);
         string[] memory emptyStrings = new string[](0);
@@ -452,7 +509,7 @@ contract RitualPredict {
             HTTP_TTL_BLOCKS,
             emptyBytes,
             bytes(""),
-            m.oracleUrl,
+            oracleUrl,
             RitualChain.HTTP_GET,
             emptyStrings,
             emptyStrings,
