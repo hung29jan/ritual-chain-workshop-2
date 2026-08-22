@@ -6,6 +6,8 @@
     "skipLibCheck": true,
     "outDir": "dist",
     "types": ["node"],
-    "verbatimModuleSyntax": true
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
   }
 }
