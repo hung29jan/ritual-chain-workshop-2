@@ -8,27 +8,28 @@ try {
   // no local .env file
 }
 
+const soliditySettings = {
+  optimizer: {
+    enabled: true,
+    runs: 200,
+  },
+  // Ritual's HTTP request ABI has 13 fields. The full resolution path also keeps
+  // response-decoding and JQ values live, which can exceed the legacy stack allocator.
+  // IR compilation is the compiler-recommended fix and keeps the code readable.
+  viaIR: true,
+} as const;
+
 export default defineConfig({
   plugins: [hardhatToolboxViemPlugin],
   solidity: {
     profiles: {
       default: {
         version: "0.8.28",
-        settings: {
-          optimizer: {
-            enabled: true,
-            runs: 200,
-          },
-        },
+        settings: soliditySettings,
       },
       production: {
         version: "0.8.28",
-        settings: {
-          optimizer: {
-            enabled: true,
-            runs: 200,
-          },
-        },
+        settings: soliditySettings,
       },
     },
   },
