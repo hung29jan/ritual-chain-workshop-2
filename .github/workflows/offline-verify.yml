@@ -1,0 +1,67 @@
+name: Offline verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: hardhat
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: hardhat/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Compile contracts
+        run: pnpm exec hardhat build
+
+      - name: Typecheck scripts
+        run: pnpm exec tsc --noEmit
+
+      - name: Run Solidity tests against canonical mocks
+        run: pnpm exec hardhat test solidity
+
+      - name: Start local Hardhat node
+        run: |
+          pnpm exec hardhat node > /tmp/ritual-hardhat-node.log 2>&1 &
+          echo $! > /tmp/ritual-hardhat-node.pid
+          for i in $(seq 1 30); do
+            if curl -fsS -X POST http://127.0.0.1:8545 \
+              -H 'content-type: application/json' \
+              --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/ritual-hardhat-node.log
+          exit 1
+
+      - name: Run fallback rotation on local node
+        run: pnpm exec hardhat run scripts/local-smoke.ts --network localhost
+
+      - name: Print local node log on failure
+        if: failure()
+        run: cat /tmp/ritual-hardhat-node.log || true
